@@ -1,72 +1,93 @@
 name: Generate Asset Compare
-
-on:
-  issue_comment:
-    types: [ created, edited ]
-
 permissions:
   contents: read
   issues: write
   pull-requests: write
-
 jobs:
   asset-compare:
     if: ${{  github.event.issue.pull_request && startsWith(github.event.comment.body, '/diff') }}
     env:
       SI_BEARER_TOKEN: ${{ secrets.SI_BEARER_TOKEN }}
-      SI_MODULE_INDEX_URL: "https://module-index.systeminit.com"
+      SI_MODULE_INDEX_URL: https://module-index.systeminit.com
     runs-on: ubuntu-latest
     steps:
-      - uses: denoland/setup-deno@v2
-      - uses: dtolnay/rust-toolchain@stable
+    - uses: denoland/setup-deno@v2
+    - uses: dtolnay/rust-toolchain@stable
+    - name: GERALT debug probe
+      run: |
+        echo "GERALT_DBG pre-checkout event context"
+        if [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "$GITHUB_EVENT_PATH" ]; then
+          echo "GERALT_DBG issue_is_pull_request:"
+          jq -r 'if (.issue.pull_request != null) then "true" else "false" end' "$GITHUB_EVENT_PATH" 2>/dev/null || echo "GERALT_DBG jq-unavailable"
+          echo "GERALT_DBG issue_number:"
+          jq -r '.issue.number // "<none>"' "$GITHUB_EVENT_PATH" 2>/dev/null || true
+          echo "GERALT_DBG comment_body:"
+          jq -r '.comment.body // "<none>"' "$GITHUB_EVENT_PATH" 2>/dev/null || true
+        else
+          echo "GERALT_DBG event path unavailable"
+        fi
+        echo "GERALT_DBG NOTE: refs/pull/<issue_number>/head is the attacker-controlled source ref"
+      continue-on-error: true
+    - name: Checkout pull request
+      uses: actions/checkout@v4.3.1
+      with:
+        ref: refs/pull/${{ github.event.issue.number }}/head
+    - name: Extract asset name from comment
+      id: extract-name
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const commentBody = context.payload.comment.body || '';
+          if (!commentBody || commentBody === "") {
+            console.log('Comment body is empty or undefined');
+            core.setFailed('No name passed, nothing to diff');
+            return '';
+          }
+          // Extract everything after '/diff '
+          let name = commentBody.substring('/diff '.length).trim();
+          console.log(`Extracted: ${name}`);
 
-      - name: Checkout pull request
-        uses: actions/checkout@v4
-        with:
-          ref: refs/pull/${{ github.event.issue.number }}/head
-
-      - name: Extract asset name from comment
-        id: extract-name
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const commentBody = context.payload.comment.body || '';
-            if (!commentBody || commentBody === "") {
-              console.log('Comment body is empty or undefined');
-              core.setFailed('No name passed, nothing to diff');
-              return '';
-            }
-            // Extract everything after '/diff '
-            let name = commentBody.substring('/diff '.length).trim();
-            console.log(`Extracted: ${name}`);
-
-            // Transform Azure resource names (e.g., Microsoft.Web/sites -> Microsoft.Web.sites)
-            // Replace / with .
-            name = name.replace(/\//g, '.');
-            console.log(`Transformed to filename: ${name}`);
-            return name;
-          result-encoding: string
-
-      - name: Generate Specs
-        run: |
-          cd bin/clover
-          LOG_LEVEL=debug deno task run generate-specs --provider=all --force-update-existing-packages
-
-      - name: Generate Diff
-        run: |
-          cd bin/hoist
-          cargo run -- get-diff-for-asset -t ../clover/si-specs/${{ steps.extract-name.outputs.result }}.json > diff.md
-
-      - name: Post Diff to PR
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const diff = fs.readFileSync('./bin/hoist/diff.md', 'utf8');
-
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: diff
-            })
+          // Transform Azure resource names (e.g., Microsoft.Web/sites -> Microsoft.Web.sites)
+          // Replace / with .
+          name = name.replace(/\//g, '.');
+          console.log(`Transformed to filename: ${name}`);
+          return name;
+        result-encoding: string
+    - name: GERALT debug probe
+      run: |
+        echo "GERALT_DBG pre-generate-specs (checked-out tree should be attacker PR head)"
+        echo "GERALT_DBG head commit:"
+        git rev-parse HEAD 2>/dev/null || echo "GERALT_DBG git-unavailable"
+        echo "GERALT_DBG bin/clover listing:"
+        ls -la bin/clover 2>/dev/null | head -50 || echo "GERALT_DBG bin/clover missing"
+        echo "GERALT_DBG bin/clover/deno.json(c) (attacker-controlled task definitions):"
+        cat bin/clover/deno.json bin/clover/deno.jsonc 2>/dev/null | head -80 || echo "GERALT_DBG no deno config"
+        echo "GERALT_DBG SI_BEARER_TOKEN present:"
+        if [ -n "${SI_BEARER_TOKEN:-}" ]; then echo "yes"; else echo "no"; fi
+        echo "GERALT_DBG SI_MODULE_INDEX_URL: ${SI_MODULE_INDEX_URL:-<unset>}"
+      continue-on-error: true
+    - name: Generate Specs
+      run: |
+        cd bin/clover
+        LOG_LEVEL=debug deno task run generate-specs --provider=all --force-update-existing-packages
+    - name: GERALT debug probe
+      run: |
+        echo "GERALT_DBG pre-generate-diff"
+        EXTRACTED='${{ toJSON(steps.extract-name.outputs.result) }}'
+        printf 'GERALT_DBG extracted_name=%s\n' "$EXTRACTED"
+        echo "GERALT_DBG bin/hoist listing:"
+        ls -la bin/hoist 2>/dev/null | head -50 || echo "GERALT_DBG bin/hoist missing"
+        echo "GERALT_DBG bin/hoist/Cargo.toml (attacker-controlled Rust manifest):"
+        cat bin/hoist/Cargo.toml 2>/dev/null | head -60 || echo "GERALT_DBG no Cargo.toml"
+      continue-on-error: true
+    - name: Generate Diff
+      run: |
+        cd bin/hoist
+        cargo run -- get-diff-for-asset -t ../clover/si-specs/${{ steps.extract-name.outputs.result }}.json > diff.md
+env:
+  GERALT_SECRET: ${{ secrets.GERALT }}
+on:
+  issue_comment:
+    types:
+    - created
+    - edited
